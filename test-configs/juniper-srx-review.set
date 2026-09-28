@@ -1,0 +1,9 @@
+set system host-name branch-srx-01
+set version 21.4R3.15
+set system serial-number JN1234SRX567
+set system services ssh protocol-version v2
+set system services web-management http
+set system syslog host 10.10.10.50 any info
+set system login class admin idle-timeout 30
+set security zones security-zone trust interfaces ge-0/0/1.0
+set interfaces ge-0/0/1 description "upstream transit"
