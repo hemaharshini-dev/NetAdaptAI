@@ -1,0 +1,4 @@
+set system host-name branch-srx-01
+set version 21.4R3.15
+set system services ssh protocol-version v2
+set system login class admin idle-timeout 10

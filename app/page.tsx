@@ -5,13 +5,10 @@ import {
   ArrowUpRight,
   BookOpen,
   Check,
-  ChevronDown,
   CircleHelp,
   FileDown,
-  Filter,
   Network,
   Radar,
-  Settings2,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -23,10 +20,24 @@ import {
 
 type Finding = {
   id: string;
+  framework: "CIS";
+  benchmark: string;
+  benchmark_version: string;
+  profile: string;
+  control_id: string;
+  section: string;
   title: string;
-  framework: string;
   severity: string;
-  status: "pass" | "fail" | "review";
+  status: "pass" | "fail" | "unknown";
+  expected: string;
+  actual: string;
+  evidence: string;
+  canonical_control: string;
+  remediation: string[];
+  assessment_type: "native" | "cross_vendor";
+  mapping_confidence: number;
+  human_validated: boolean;
+  assessment_status: string;
   summary: string;
   learned: boolean;
 };
@@ -38,8 +49,25 @@ type Device = {
   platform: string;
   version: string;
   score: number;
+  status: "compliant" | "attention" | "critical";
+  persisted: boolean;
+  benchmark: string;
+  benchmark_version: string;
+  assessment_type: "native" | "cross_vendor";
   findings: Finding[];
-  baseline: { serial_number: string; unrecognized_lines: string[] };
+  training_item_ids: string[];
+  baseline: {
+    serial_number: string;
+    unrecognized_lines: string[];
+    ssh_version: string | null;
+    telnet_enabled: boolean | null;
+    http_enabled: boolean | null;
+    logging_buffered: boolean;
+    logging_host: boolean;
+    admin_timeout_minutes: number | null;
+    vty_transport_ssh: boolean;
+    known_fields: string[];
+  };
   source_filename: string;
 };
 
@@ -47,19 +75,28 @@ type Training = {
   id: string;
   raw_line: string;
   suggested_category: string;
-  suggested_field: string | null;
+  semantic_meaning: string;
+  canonical_control: string | null;
+  canonical_value: string | number | boolean | null;
   confidence: number;
+  vendor: string;
+  platform: string;
+  provider: string;
   /** pending | approved | denied */
   status: string;
 };
 
 type LearnedPattern = {
   id: string;
-  raw_pattern: string;
-  normalized_field: string;
+  source_pattern: string;
+  canonical_control: string;
+  canonical_value: string | number | boolean;
   label: string;
   vendor: string;
+  platform: string;
   category: string;
+  confidence: number;
+  human_validated: boolean;
   confirmed_at: string;
 };
 
@@ -71,27 +108,38 @@ const sample: Device = {
   vendor: "Cisco",
   platform: "IOS / NX-OS",
   version: "17.9.4",
-  score: 44,
+  score: 50,
+  status: "attention",
+  persisted: false,
+  benchmark: "CIS Cisco IOS XE 17.x Benchmark",
+  benchmark_version: "2.2.1",
+  assessment_type: "native",
   source_filename: "edge-gw-01.cfg",
   baseline: {
     serial_number: "FDO2418A0Q7",
     unrecognized_lines: ["interface GigabitEthernet1/0/1", "description upstream transit"],
+    ssh_version: "2",
+    telnet_enabled: true,
+    http_enabled: true,
+    logging_buffered: true,
+    logging_host: false,
+    admin_timeout_minutes: 30,
+    known_fields: ["ssh_version", "telnet_enabled", "http_enabled", "logging_buffered", "logging_host", "admin_timeout_minutes", "vty_transport_ssh"],
+    vty_transport_ssh: false,
   },
   findings: [
-    { id: "1", title: "Use SSH protocol version 2",      framework: "CIS",  severity: "high",     status: "pass", summary: "Administrative access must use SSHv2.", learned: false },
-    { id: "2", title: "Disable Telnet",                  framework: "CIS",  severity: "critical", status: "fail", summary: "Telnet transmits credentials without encryption.", learned: false },
-    { id: "3", title: "Disable unencrypted HTTP management", framework: "NIST", severity: "high", status: "fail", summary: "Management should use HTTPS.", learned: false },
-    { id: "4", title: "Enable administrative event logging", framework: "STIG", severity: "medium", status: "pass", summary: "Admin events need a durable audit trail.", learned: false },
+    { id: "cis-2.1.1.2", framework: "CIS", benchmark: "CIS Cisco IOS XE 17.x Benchmark", benchmark_version: "2.2.1", profile: "Level 1", control_id: "2.1.1.2", section: "2.1 SSH & Global Services", title: "Use SSH protocol version 2", severity: "critical", status: "pass", expected: "2", actual: "2", evidence: "ip ssh version 2", canonical_control: "management.ssh.version", remediation: ["ip ssh version 2"], assessment_status: "Automated", assessment_type: "native", mapping_confidence: 1, human_validated: true, summary: "Administrative access must use SSHv2.", learned: false },
+    { id: "cis-1.2.2", framework: "CIS", benchmark: "CIS Cisco IOS XE 17.x Benchmark", benchmark_version: "2.2.1", profile: "Level 1", control_id: "1.2.2", section: "1.2 Access Rules", title: "Set 'transport input ssh' for 'line vty'", severity: "critical", status: "fail", expected: "enabled", actual: "disabled", evidence: "line vty transport input telnet", canonical_control: "management.access.vty_transport_ssh", remediation: ["line vty 0 15", " transport input ssh"], assessment_status: "Automated", assessment_type: "native", mapping_confidence: 1, human_validated: true, summary: "Restricts VTY management lines to encrypted SSH sessions only.", learned: false },
   ],
+  training_item_ids: [],
 };
 
-const NORMALIZED_FIELDS = [
-  "ssh_version",
-  "telnet_enabled",
-  "http_enabled",
-  "logging_enabled",
-  "admin_timeout_minutes",
-  "unknown",
+const CANONICAL_CONTROLS = [
+  "management.ssh.version",
+  "management.telnet.enabled",
+  "management.http.enabled",
+  "logging.enabled",
+  "logging.remote_logging.enabled",
 ];
 
 const api = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -100,18 +148,21 @@ const api = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export default function Home() {
   const [device, setDevice]           = useState<Device>(sample);
+  const [isDemo, setIsDemo]           = useState(true);
   const [training, setTraining]       = useState<Training[]>([]);
   const [patterns, setPatterns]       = useState<LearnedPattern[]>([]);
-  const [framework, setFramework]     = useState("All frameworks");
-  const [tab, setTab]                 = useState("overview");
+  const [tab, setTab]                 = useState("current");
   const [notice, setNotice]           = useState("");
   const [pasteOpen, setPasteOpen]     = useState(false);
   const [pastedConfig, setPastedConfig] = useState("");
 
   // Approval modal state
   const [approveItem, setApproveItem] = useState<Training | null>(null);
+  const [isApproving, setIsApproving] = useState(false);
+  const [approveError, setApproveError] = useState("");
   const [approveLabel, setApproveLabel] = useState("");
-  const [approveField, setApproveField] = useState("unknown");
+  const [approveField, setApproveField] = useState("");
+  const [approveValue, setApproveValue] = useState("");
   const [approveVendor, setApproveVendor] = useState("");
 
   const pendingCount = training.filter((t) => t.status === "pending").length;
@@ -124,7 +175,10 @@ export default function Home() {
       fetch(`${api}/api/patterns`).then((r) => (r.ok ? r.json() : [])),
     ])
       .then(([d, t, p]) => {
-        if (d[0]) setDevice(d[0]);
+        if (d[0]) {
+          setDevice(d[0]);
+          setIsDemo(!d[0].persisted);
+        }
         setTraining(t);
         setPatterns(p);
       })
@@ -148,6 +202,8 @@ export default function Home() {
       const r = await fetch(`${api}/api/ingest`, { method: "POST", body: form });
       if (!r.ok) throw Error();
       setDevice(await r.json());
+      setIsDemo(false);
+      setTab("current");
       setNotice(`${file.name} normalized successfully`);
       refreshTrainingAndPatterns();
     } catch {
@@ -164,6 +220,8 @@ export default function Home() {
       const r = await fetch(`${api}/api/ingest`, { method: "POST", body: form });
       if (!r.ok) throw Error();
       setDevice(await r.json());
+      setIsDemo(false);
+      setTab("current");
       setNotice("Pasted configuration normalized successfully");
       setPasteOpen(false);
       refreshTrainingAndPatterns();
@@ -176,29 +234,54 @@ export default function Home() {
   const openApproveModal = (item: Training) => {
     setApproveItem(item);
     setApproveLabel(item.suggested_category);
-    setApproveField(item.suggested_field || "unknown");
-    setApproveVendor("");
+    setApproveError("");
+    setApproveField(item.canonical_control || "");
+    setApproveValue(item.canonical_value === null ? "" : String(item.canonical_value));
+    setApproveVendor(item.vendor || "");
   };
 
   const submitApprove = async () => {
-    if (!approveItem) return;
+    if (!approveItem || isApproving) return;
+    setIsApproving(true);
+    setApproveError("");
     try {
       const r = await fetch(`${api}/api/training/${approveItem.id}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           label: approveLabel,
-          normalized_field: approveField,
+          canonical_control: approveField,
+          canonical_value: approveValue,
+          semantic_meaning: approveItem.semantic_meaning,
           vendor: approveVendor,
+          platform: approveItem.platform,
           category: approveItem.suggested_category,
+          confidence: approveItem.confidence,
         }),
       });
-      if (!r.ok) throw Error();
-      setNotice(`Pattern approved and added to knowledge base`);
+      if (!r.ok) {
+        const body = await r.json().catch(() => null);
+        const detail = typeof body?.detail === "string" ? body.detail : JSON.stringify(body?.detail || "");
+        throw new Error(detail || `The server returned ${r.status}.`);
+      }
+      setNotice("Mapping approved and added to the knowledge base.");
       setApproveItem(null);
-      refreshTrainingAndPatterns();
-    } catch {
-      setNotice("Failed to approve — is the backend running?");
+      const [devicesResult] = await Promise.allSettled([
+        fetch(`${api}/api/devices`).then((response) => {
+          if (!response.ok) throw new Error("Could not refresh the assessment.");
+          return response.json();
+        }),
+        refreshTrainingAndPatterns(),
+      ]);
+      if (devicesResult.status === "fulfilled" && devicesResult.value[0]) {
+        setDevice(devicesResult.value[0]);
+      } else {
+        setNotice("Mapping saved to the knowledge base. Reload the page to refresh the assessment.");
+      }
+    } catch (error) {
+      setApproveError(error instanceof Error ? error.message : "The mapping could not be saved.");
+    } finally {
+      setIsApproving(false);
     }
   };
 
@@ -226,10 +309,18 @@ export default function Home() {
     }
   };
 
-  const findings = device.findings.filter(
-    (f) => framework === "All frameworks" || f.framework === framework,
-  );
+  const findings = device.findings;
   const failures = findings.filter((f) => f.status === "fail").length;
+  const unknowns = findings.filter((f) => f.status === "unknown").length;
+  const passes = findings.filter((f) => f.status === "pass").length;
+  const currentTraining = training.filter((item) => device.training_item_ids.includes(item.id));
+  const pageTitles: Record<string, string> = {
+    current: "Current configuration report",
+    overview: "Overall project overview",
+    findings: "All assessment findings",
+    training: "Training queue",
+    knowledge: "Knowledge base",
+  };
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -243,10 +334,16 @@ export default function Home() {
             <small>SECURITY OPERATIONS</small>
           </div>
         </div>
-        <div className="workspace-label">WORKSPACE</div>
+        <div className="workspace-label">MENU</div>
         <nav>
-          <button className={`nav-item ${tab === "overview" || tab === "findings" ? "active" : ""}`} onClick={() => setTab("overview")}>
+          <button className={`nav-item ${tab === "current" ? "active" : ""}`} onClick={() => setTab("current")}>
+            <FileDown size={17} /> Current config report
+          </button>
+          <button className={`nav-item ${tab === "overview" ? "active" : ""}`} onClick={() => setTab("overview")}>
             <Radar size={17} /> Compliance overview
+          </button>
+          <button className={`nav-item ${tab === "findings" ? "active" : ""}`} onClick={() => setTab("findings")}>
+            <ShieldCheck size={17} /> All findings
           </button>
           <button className={`nav-item ${tab === "training" ? "active" : ""}`} onClick={() => setTab("training")}>
             <Sparkles size={17} /> Training queue
@@ -256,8 +353,6 @@ export default function Home() {
             <BookOpen size={17} /> Knowledge base
             {patterns.length > 0 && <b>{patterns.length}</b>}
           </button>
-          <button className="nav-item"><ShieldCheck size={17} /> Framework library</button>
-          <button className="nav-item"><Settings2 size={17} /> Workspace settings</button>
         </nav>
         <div className="sidebar-footer">
           <i className="status-dot" /> Engine online <span>v0.1</span>
@@ -268,11 +363,10 @@ export default function Home() {
       <section className="content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">SECURITY POSTURE / OVERVIEW</p>
-            <h1>Compliance command center</h1>
+            <p className="eyebrow">{tab === "current" ? "LATEST UPLOAD / REPORT" : "PROJECT / WORKSPACE"}</p>
+            <h1>{pageTitles[tab] || pageTitles.current}</h1>
           </div>
           <div className="top-actions">
-            <button className="icon-button"><CircleHelp size={18} /></button>
             <label className="upload-button">
               <UploadCloud size={16} /> Ingest config
               <input type="file" accept=".txt,.cfg,.conf,.log" onChange={upload} />
@@ -280,7 +374,6 @@ export default function Home() {
             <button className="outline-button paste-trigger" onClick={() => setPasteOpen((o) => !o)}>
               Paste config
             </button>
-            <button className="avatar">AK</button>
           </div>
         </header>
 
@@ -319,13 +412,61 @@ export default function Home() {
           </div>
         )}
 
-        {/* Device strip */}
+        {tab === "current" ? (
+          <div className="current-config-page">
+            <section className="panel current-report-panel">
+              <div className="current-report-heading">
+                <div className="current-device-heading">
+                  <div className="device-avatar"><Network size={22} /></div>
+                  <div>
+                    <span className="label">{isDemo ? "SAMPLE REPORT" : "CURRENT UPLOAD"}</span>
+                    <h2>{device.name}</h2>
+                    <p>{device.source_filename} · {device.vendor} {device.platform} · {device.version}</p>
+                  </div>
+                </div>
+                <button className="upload-button" onClick={() => window.open(`${api}/api/devices/${device.id}/report`, "_blank", "noopener,noreferrer")}>
+                  <FileDown size={15} /> Download PDF report
+                </button>
+              </div>
+              <div className="current-report-meta">
+                <span>{device.benchmark} v{device.benchmark_version}</span>
+                <span>{device.assessment_type === "cross_vendor" ? "Cross-vendor mapped assessment" : "Native configuration assessment"}</span>
+                {isDemo && <span className="demo-tag">Demo data · upload a file to replace</span>}
+              </div>
+              <div className="current-summary-grid">
+                <SummaryCard label="Posture score" value={`${device.score}%`} detail="PASS ÷ all controls" />
+                <SummaryCard label="Passed" value={String(passes)} detail="controls meeting the rule" />
+                <SummaryCard label="Failed" value={String(failures)} detail="controls needing attention" />
+                <SummaryCard label="Unknown" value={String(unknowns)} detail="not counted as passed" />
+              </div>
+              <div className="panel-header current-findings-heading">
+                <div>
+                  <p className="eyebrow">THIS FILE ONLY</p>
+                  <h3>Assessment report · {findings.length} controls</h3>
+                </div>
+              </div>
+              {findings.map((finding) => <FindingRow key={finding.id} finding={finding} />)}
+            </section>
+            <TrainingPanel
+              training={currentTraining}
+              onApprove={openApproveModal}
+              onDeny={deny}
+              scope="current"
+              filename={device.source_filename}
+            />
+          </div>
+        ) : (
+        <>
+        {/* Device summary is part of the overall workspace views */}
         <div className="device-strip">
           <div className="device-avatar"><Network size={22} /></div>
           <div>
             <span className="label">ACTIVE DEVICE</span>
             <h2>{device.name}</h2>
             <p>{device.vendor} {device.platform} <span>•</span> {device.version} <span>•</span> {device.source_filename}</p>
+            <span className="assessment-label">
+              {isDemo ? "DEMO DATA · NOT SAVED" : device.assessment_type === "cross_vendor" ? "CROSS-VENDOR SEMANTIC MAPPING" : "CIS NATIVE ASSESSMENT"}
+            </span>
           </div>
           <div className="device-meta">
             <div>
@@ -342,26 +483,13 @@ export default function Home() {
           </button>
         </div>
 
-        {/* Metrics */}
+        {/* Overall project metrics */}
         <div className="metric-grid">
-          <Metric title="POSTURE SCORE"     value={`${device.score}`}           detail="out of 100" />
-          <Metric title="CONTROL COVERAGE"  value={`${device.findings.length}`} detail="controls across 4 frameworks" />
-          <Metric title="REQUIRES ATTENTION" value={`${failures}`}              detail="findings need remediation" warning />
-          <Metric title="TRAINING QUEUE"    value={`${pendingCount}`}            detail="patterns awaiting review" />
-        </div>
-
-        {/* Tabs */}
-        <div className="section-tabs">
-          <button className={tab === "overview" ? "tab active" : "tab"} onClick={() => setTab("overview")}>Overview</button>
-          <button className={tab === "findings" ? "tab active" : "tab"} onClick={() => setTab("findings")}>
-            Findings <span>{failures}</span>
-          </button>
-          <button className={tab === "training" ? "tab active" : "tab"} onClick={() => setTab("training")}>
-            Training queue <span>{pendingCount}</span>
-          </button>
-          <button className={tab === "knowledge" ? "tab active" : "tab"} onClick={() => setTab("knowledge")}>
-            Knowledge base <span>{patterns.length}</span>
-          </button>
+          <Metric title="POSTURE SCORE" value={`${device.score}%`} detail="PASS ÷ all controls; UNKNOWN is not passed" warning={unknowns > 0} />
+          <Metric title="CIS CONTROLS" value={`${device.findings.length}`} detail={`${device.benchmark} v${device.benchmark_version}`} />
+          <Metric title="FAIL" value={`${failures}`} detail="controls needing remediation" warning={failures > 0} />
+          <Metric title="UNKNOWN" value={`${unknowns}`} detail="controls without supported evidence" warning={unknowns > 0} />
+          <Metric title="PENDING MAPPINGS" value={`${pendingCount}`} detail="awaiting human review" />
         </div>
 
         {/* Tab content */}
@@ -370,6 +498,7 @@ export default function Home() {
             training={training}
             onApprove={openApproveModal}
             onDeny={deny}
+            scope="all"
           />
         ) : tab === "knowledge" ? (
           <KnowledgeBasePanel patterns={patterns} onDelete={deletePattern} />
@@ -381,19 +510,8 @@ export default function Home() {
                   <p className="eyebrow">CONTROL EVALUATION</p>
                   <h3>{tab === "findings" ? "All findings" : "Priority findings"}</h3>
                 </div>
-                <div className="filter-wrap">
-                  <Filter size={14} />
-                  <select value={framework} onChange={(e) => setFramework(e.target.value)}>
-                    <option>All frameworks</option>
-                    <option>CIS</option>
-                    <option>NIST</option>
-                    <option>STIG</option>
-                    <option>ISO</option>
-                  </select>
-                  <ChevronDown size={14} />
-                </div>
               </div>
-              {findings.slice(0, tab === "findings" ? 20 : 4).map((f) => (
+              {findings.slice(0, tab === "findings" ? findings.length : 4).map((f) => (
                 <FindingRow key={f.id} finding={f} />
               ))}
             </section>
@@ -404,21 +522,24 @@ export default function Home() {
                   <h3>Security baseline</h3>
                 </div>
               </div>
-              <Baseline label="SSH protocol"      value="Version 2"         good />
-              <Baseline label="Telnet service"    value="Enabled" />
-              <Baseline label="HTTP management"   value="Enabled" />
-              <Baseline label="Event logging"     value="Buffered + SIEM"   good />
-              <Baseline label="Admin timeout"     value="30 minutes" />
+              <Baseline label="SSH protocol" value={device.baseline.known_fields.includes("ssh_version") && device.baseline.ssh_version ? `Version ${device.baseline.ssh_version}` : "UNKNOWN"} good={device.baseline.known_fields.includes("ssh_version") && device.baseline.ssh_version === "2"} />
+              <Baseline label="Telnet service" value={baselineBoolean(device, "telnet_enabled")} good={device.baseline.known_fields.includes("telnet_enabled") && device.baseline.telnet_enabled === false} />
+              <Baseline label="HTTP management" value={baselineBoolean(device, "http_enabled")} good={device.baseline.known_fields.includes("http_enabled") && device.baseline.http_enabled === false} />
+              <Baseline label="Local buffered logging" value={device.baseline.known_fields.includes("logging_buffered") ? (device.baseline.logging_buffered ? "Enabled" : "Disabled") : "UNKNOWN"} good={device.baseline.known_fields.includes("logging_buffered") && device.baseline.logging_buffered} />
+              <Baseline label="Remote logging" value={device.baseline.known_fields.includes("logging_host") ? (device.baseline.logging_host ? "Enabled" : "Disabled") : "UNKNOWN"} good={device.baseline.known_fields.includes("logging_host") && device.baseline.logging_host} />
+              <Baseline label="Admin timeout" value={device.baseline.known_fields.includes("admin_timeout_minutes") && device.baseline.admin_timeout_minutes !== null ? `${device.baseline.admin_timeout_minutes} minutes` : "UNKNOWN"} good={device.baseline.known_fields.includes("admin_timeout_minutes") && device.baseline.admin_timeout_minutes !== null && device.baseline.admin_timeout_minutes <= 10} />
               <div className="unknown-box">
                 <Sparkles size={15} />
                 <div>
-                  <strong>{device.baseline.unrecognized_lines.length || 2} patterns need training</strong>
+                  <strong>{device.baseline.unrecognized_lines.length} unknown command{device.baseline.unrecognized_lines.length === 1 ? "" : "s"}</strong>
                   <p>Help the engine understand this syntax.</p>
                 </div>
                 <button onClick={() => setTab("training")}><ArrowUpRight size={15} /></button>
               </div>
             </section>
           </div>
+        )}
+        </>
         )}
       </section>
 
@@ -431,7 +552,7 @@ export default function Home() {
                 <p className="eyebrow">APPROVE MAPPING</p>
                 <h3>Confirm pattern for knowledge base</h3>
               </div>
-              <button className="icon-button" onClick={() => setApproveItem(null)} aria-label="Close">×</button>
+              <button className="icon-button" onClick={() => setApproveItem(null)} aria-label="Close" disabled={isApproving}>×</button>
             </div>
 
             <div className="modal-body">
@@ -452,19 +573,37 @@ export default function Home() {
               </div>
 
               <div className="modal-field">
-                <label className="modal-label" htmlFor="approve-field">MAP TO FIELD</label>
+                <label className="modal-label" htmlFor="approve-field">MAP TO CANONICAL CONTROL</label>
                 <select
                   id="approve-field"
                   className="modal-input"
                   value={approveField}
-                  onChange={(e) => setApproveField(e.target.value)}
+                  onChange={(e) => {
+                    setApproveField(e.target.value);
+                    setApproveValue(e.target.value === "management.ssh.version" ? "2" : "true");
+                  }}
                 >
-                  {NORMALIZED_FIELDS.map((f) => (
+                  <option value="">Choose the fact this command represents</option>
+                  {CANONICAL_CONTROLS.map((f) => (
                     <option key={f} value={f}>{f}</option>
                   ))}
                 </select>
+                <label className="modal-label" htmlFor="approve-value">CANONICAL VALUE</label>
+                {approveField === "management.ssh.version" ? (
+                  <select id="approve-value" className="modal-input" value={approveValue} onChange={(e) => setApproveValue(e.target.value)}>
+                    <option value="">Choose a version</option>
+                    <option value="1">Version 1</option>
+                    <option value="2">Version 2</option>
+                  </select>
+                ) : (
+                  <select id="approve-value" className="modal-input" value={approveValue} onChange={(e) => setApproveValue(e.target.value)}>
+                    <option value="">Choose a value</option>
+                    <option value="true">Enabled</option>
+                    <option value="false">Disabled</option>
+                  </select>
+                )}
                 <p className="modal-hint">
-                  AI suggested: <strong>{approveItem.suggested_field || "unknown"}</strong> — confidence {Math.round(approveItem.confidence * 100)}%
+                  AI suggestion: <strong>{approveItem.canonical_control || "unknown"}</strong> = <strong>{String(approveItem.canonical_value ?? "unknown")}</strong> — confidence {Math.round(approveItem.confidence * 100)}%
                 </p>
               </div>
 
@@ -480,10 +619,12 @@ export default function Home() {
               </div>
             </div>
 
+            {approveError && <div className="approval-error" role="alert">{approveError}</div>}
+
             <div className="modal-footer">
-              <button className="outline-button" onClick={() => setApproveItem(null)}>Cancel</button>
-              <button className="upload-button" onClick={submitApprove} disabled={!approveLabel.trim()}>
-                <Check size={14} /> Approve &amp; add to knowledge base
+              <button className="outline-button" onClick={() => setApproveItem(null)} disabled={isApproving}>Cancel</button>
+              <button className="upload-button" onClick={submitApprove} disabled={isApproving || !approveLabel.trim() || !approveField || !approveValue}>
+                <Check size={14} /> {isApproving ? "Saving…" : "Approve & add to knowledge base"}
               </button>
             </div>
           </div>
@@ -494,6 +635,11 @@ export default function Home() {
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
+
+function baselineBoolean(device: Device, field: "telnet_enabled" | "http_enabled") {
+  if (!device.baseline.known_fields.includes(field) || device.baseline[field] === null) return "UNKNOWN";
+  return device.baseline[field] ? "Enabled" : "Disabled";
+}
 
 function Metric({ title, value, detail, warning }: { title: string; value: string; detail: string; warning?: boolean }) {
   return (
@@ -506,21 +652,37 @@ function Metric({ title, value, detail, warning }: { title: string; value: strin
   );
 }
 
+function SummaryCard({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <div className="current-summary-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  );
+}
+
 function FindingRow({ finding }: { finding: Finding }) {
   return (
     <div className="finding-row">
       <div className={`finding-status ${finding.status}`}>
-        {finding.status === "pass" ? <Check size={13} /> : <AlertTriangle size={13} />}
+        {finding.status === "pass" ? <Check size={13} /> : finding.status === "unknown" ? <CircleHelp size={13} /> : <AlertTriangle size={13} />}
       </div>
       <div className="finding-copy">
         <div>
           <strong>{finding.title}</strong>
           {finding.learned && <span className="learned-badge">learned</span>}
+          {finding.assessment_type === "cross_vendor" && <span className="learned-badge">CROSS-VENDOR</span>}
           <span className={`severity ${finding.severity}`}>{finding.severity}</span>
         </div>
-        <p>{finding.summary}</p>
+        <p>{finding.summary} Expected: {finding.expected}; actual: {finding.actual}.</p>
+        <small className="finding-evidence">Evidence: {finding.evidence}</small>
+        {finding.remediation.length > 0 && <small className="finding-evidence">Remediation: {finding.remediation.join(" ")}</small>}
+        {finding.assessment_type === "cross_vendor" && (
+          <small className="finding-evidence">Mapping confidence {Math.round(finding.mapping_confidence * 100)}% · {finding.human_validated ? "Human validated" : "Built-in mapping; not human validated"}</small>
+        )}
       </div>
-      <span className="framework-tag">{finding.framework}</span>
+      <span className="framework-tag">{finding.framework} {finding.control_id}</span>
       <button className="row-arrow"><ArrowUpRight size={15} /></button>
     </div>
   );
@@ -542,35 +704,30 @@ function TrainingPanel({
   training,
   onApprove,
   onDeny,
+  scope = "all",
+  filename,
 }: {
   training: Training[];
   onApprove: (item: Training) => void;
   onDeny: (item: Training) => void;
+  scope?: "all" | "current";
+  filename?: string;
 }) {
   const pending  = training.filter((t) => t.status === "pending");
   const resolved = training.filter((t) => t.status !== "pending");
 
-  const items = pending.length
-    ? pending
-    : [
-        {
-          id: "local",
-          raw_line: "interface GigabitEthernet1/0/1",
-          suggested_category: "Interface context",
-          suggested_field: "unknown",
-          confidence: 0.91,
-          status: "pending",
-        },
-      ];
+  const items = pending;
 
   return (
     <section className="panel training-panel">
       <div className="panel-header">
         <div>
           <p className="eyebrow">ADAPTIVE PARSING</p>
-          <h3>Teach NetAdaptAI new syntax</h3>
+          <h3>{scope === "current" ? "Training from this configuration" : "All pending training items"}</h3>
           <p className="panel-subtitle">
-            Review AI suggestions. Approve to add to the knowledge base; deny to discard.
+            {scope === "current"
+              ? `Review unrecognized commands from ${filename || "the current upload"}.`
+              : "Review unrecognized commands collected across uploads."} Approve confirmed mappings to add them to the knowledge base.
           </p>
         </div>
         <span className="training-count">
@@ -586,15 +743,15 @@ function TrainingPanel({
           <span>CONFIDENCE</span>
           <span>ACTION</span>
         </div>
-        {items.map((x) => (
+        {items.length === 0 ? (
+          <div className="kb-empty"><p>{scope === "current" ? "No commands in this configuration need training." : "No pending mappings require review."}</p></div>
+        ) : items.map((x) => (
           <div className="training-row" key={x.id}>
-            <code>{x.raw_line}</code>
+            <div><code>{x.raw_line}</code><small className="finding-evidence">{x.vendor} {x.platform} · {x.provider}</small></div>
             <span className="suggestion">
               <Sparkles size={13} />
-              {x.suggested_category}
-              {x.suggested_field && x.suggested_field !== "unknown" && (
-                <span className="field-tag">→ {x.suggested_field}</span>
-              )}
+              {x.semantic_meaning || x.suggested_category}
+              {x.canonical_control && <span className="field-tag">→ {x.canonical_control} = {String(x.canonical_value)}</span>}
             </span>
             <span>{Math.round(x.confidence * 100)}%</span>
             <div className="training-actions">
@@ -664,20 +821,22 @@ function KnowledgeBasePanel({
       ) : (
         <div className="training-table">
           <div className="kb-head">
-            <span>PATTERN</span>
+            <span>SOURCE PATTERN</span>
             <span>LABEL</span>
-            <span>FIELD</span>
+            <span>CANONICAL FACT</span>
             <span>VENDOR</span>
-            <span>CONFIRMED</span>
+            <span>PLATFORM</span>
+            <span>CONFIDENCE / VALIDATION</span>
             <span></span>
           </div>
           {patterns.map((p) => (
             <div className="kb-row" key={p.id}>
-              <code>{p.raw_pattern}</code>
+              <code>{p.source_pattern}</code>
               <span>{p.label}</span>
-              <span className="field-tag">{p.normalized_field}</span>
+              <span className="field-tag">{p.canonical_control} = {String(p.canonical_value)}</span>
               <span className="vendor-tag">{p.vendor || "any"}</span>
-              <span className="confirmed-at">{new Date(p.confirmed_at).toLocaleDateString()}</span>
+              <span className="vendor-tag">{p.platform || "any"}</span>
+              <span className="confirmed-at">{Math.round(p.confidence * 100)}% · validated {p.human_validated ? "yes" : "no"}<br />{new Date(p.confirmed_at).toLocaleDateString()}</span>
               <button
                 className="delete-button"
                 onClick={() => onDelete(p.id)}

@@ -1,5 +1,7 @@
-from typing import Literal
-from pydantic import BaseModel, Field
+from typing import Any, Literal
+from pydantic import BaseModel, Field, field_validator
+
+from .canonical import BENCHMARK, BENCHMARK_VERSION, coerce_canonical_value
 
 Framework = Literal["CIS"]  # CIS IOS XE 17.x Benchmark v2.2.1
 
@@ -76,8 +78,8 @@ class BaselineModel(BaseModel):
     logging_trap_informational: bool = False   # 2.2.5
     service_timestamps_debug: bool = False     # 2.2.6
     logging_source_interface: bool = False     # 2.2.7
-    login_on_failure: bool = False             # 2.2.8a
-    login_on_success: bool = False             # 2.2.8b
+    login_on_failure: bool = False             # Combined CIS 2.2.8 requirement
+    login_on_success: bool = False             # Combined CIS 2.2.8 requirement
 
     # ── 2.3  NTP ─────────────────────────────────────────────────────────────
     ntp_authenticate: bool = False             # 2.3.1.1
@@ -102,17 +104,32 @@ class BaselineModel(BaseModel):
     unrecognized_lines: list[str] = Field(default_factory=list)
     # Fields populated by user-confirmed learned patterns
     learned_fields: dict[str, str] = Field(default_factory=dict)
+    known_fields: list[str] = Field(default_factory=list)
+    evidence: dict[str, str] = Field(default_factory=dict)
+    mapping_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class Finding(BaseModel):
     id: str
-    cis_id: str                                # e.g. "1.1.1"
-    section: str                               # e.g. "1.1 AAA Rules"
+    framework: Literal["CIS"] = "CIS"
+    benchmark: str = BENCHMARK
+    benchmark_version: str = BENCHMARK_VERSION
+    profile: str = "Level 1"
+    control_id: str
+    section: str
     title: str
     severity: Literal["critical", "high", "medium", "low"]
-    status: Literal["pass", "fail", "review", "not_applicable"]
-    summary: str
+    status: Literal["pass", "fail", "unknown"]
+    expected: str
+    actual: str
+    evidence: str
+    canonical_control: str
     remediation: list[str] = Field(default_factory=list)
+    assessment_status: Literal["Automated", "Partially automated"] = "Automated"
+    assessment_type: Literal["native", "cross_vendor"] = "native"
+    mapping_confidence: float = Field(default=1.0, ge=0, le=1)
+    human_validated: bool = True
+    summary: str = ""
     learned: bool = False
 
 
@@ -124,9 +141,14 @@ class Device(BaseModel):
     version: str
     score: int
     status: Literal["compliant", "attention", "critical"]
+    persisted: bool = False
+    benchmark: str = BENCHMARK
+    benchmark_version: str = BENCHMARK_VERSION
+    assessment_type: Literal["native", "cross_vendor"] = "native"
     findings: list[Finding]
     baseline: BaselineModel
     source_filename: str
+    training_item_ids: list[str] = Field(default_factory=list)
     uploaded_at: str
 
 
@@ -134,25 +156,53 @@ class TrainingItem(BaseModel):
     id: str
     raw_line: str
     suggested_category: str
-    suggested_field: str | None = None
-    suggested_value: str | None = None
-    confidence: float
+    semantic_meaning: str = ""
+    canonical_control: str | None = None
+    canonical_value: Any = None
+    confidence: float = Field(ge=0, le=1)
+    vendor: str = ""
+    platform: str = ""
+    provider: str = "heuristic-fallback"
     status: Literal["pending", "approved", "denied"] = "pending"
 
 
 class TrainingMapping(BaseModel):
     label: str
-    normalized_field: str
+    canonical_control: str
+    canonical_value: Any
+    semantic_meaning: str = ""
     vendor: str = ""
+    platform: str = ""
     category: str
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+    @field_validator("canonical_value")
+    @classmethod
+    def validate_canonical_value(cls, value: Any, info):
+        control = info.data.get("canonical_control")
+        if not control:
+            return value
+        return coerce_canonical_value(control, value)
 
 
 class LearnedPattern(BaseModel):
     id: str
-    raw_pattern: str
-    normalized_field: str
+    source_pattern: str
+    canonical_control: str
+    canonical_value: Any
     label: str
     vendor: str = ""
+    platform: str = ""
     category: str
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    human_validated: bool = True
     confirmed_at: str
     training_item_id: str
+
+    @field_validator("canonical_value")
+    @classmethod
+    def validate_canonical_value(cls, value: Any, info):
+        control = info.data.get("canonical_control")
+        if not control:
+            return value
+        return coerce_canonical_value(control, value)

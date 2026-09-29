@@ -6,8 +6,17 @@ and Data Plane (§3).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Literal
 
+from .canonical import (
+    BENCHMARK,
+    BENCHMARK_VERSION,
+    canonical_control_for_field,
+    field_for_canonical_control,
+    coerce_canonical_value,
+    register_supported_fields,
+)
 from .models import BaselineModel, Finding, LearnedPattern
 
 
@@ -71,7 +80,11 @@ def normalize_config(
     """Parse raw IOS XE CLI text into a :class:`BaselineModel`."""
 
     # ── Identity ──────────────────────────────────────────────────────────────
-    hostname = _find(r"^hostname\s+(\S+)", text) or "Unknown device"
+    hostname = (
+        _find(r"^hostname\s+(\S+)", text)
+        or _find(r"^set system host-name\s+(\S+)", text)
+        or "Unknown device"
+    )
     vendor = (
         "Cisco"
         if _search(r"Cisco IOS|version\s+\d+\.\d+.*IOS|IOS.XE", text)
@@ -87,6 +100,7 @@ def normalize_config(
     version = _find(r"version\s+([\w.()/-]+)", text) or "Unknown"
     serial = (
         _find(r"(?:serial number|Chassis serial number)\s*[:#]?\s*(\S+)", text)
+        or _find(r"^set system serial-number\s+(\S+)", text)
         or "Not discovered"
     )
     ip_domain_name = _find(r"ip domain-name\s+(\S+)", text)
@@ -273,27 +287,48 @@ def normalize_config(
         "shutdown", "boot", "end", "!", "^C",
     )
     lines_clean = [l.strip() for l in text.splitlines() if l.strip() and l.strip() != "!"]
+    juniper_ssh_line = next(
+        (line for line in lines_clean if re.match(
+            r"set system services ssh protocol-version v2\b", line, re.I
+        )),
+        None,
+    ) if vendor == "Juniper" else None
     unrecognized = [
         l for l in lines_clean
+        if l != juniper_ssh_line
         if not any(l.lower().startswith(kw.lower()) for kw in known_kw)
     ]
 
     # ── Apply learned patterns ────────────────────────────────────────────────
     learned_fields: dict[str, str] = {}
+    learned_values: dict[str, object] = {}
+    mapping_metadata: dict[str, dict] = {}
     still_unrecognized: list[str] = []
     for line in unrecognized:
         matched = False
         for pattern in (learned_patterns or []):
-            if pattern.vendor and pattern.vendor.lower() not in vendor.lower():
+            if pattern.vendor and pattern.vendor.lower() != vendor.lower():
                 continue
-            if pattern.raw_pattern.lower() in line.lower():
-                learned_fields[pattern.normalized_field] = line
+            if pattern.platform and pattern.platform.lower() not in platform.lower():
+                continue
+            if pattern.source_pattern.lower() in line.lower():
+                field = field_for_canonical_control(pattern.canonical_control)
+                if field is None:
+                    continue
+                value = coerce_canonical_value(pattern.canonical_control, pattern.canonical_value)
+                learned_fields[field] = line
+                learned_values[field] = value
+                mapping_metadata[field] = {
+                    "confidence": pattern.confidence,
+                    "human_validated": pattern.human_validated,
+                    "source": "knowledge_base",
+                }
                 matched = True
                 break
         if not matched:
             still_unrecognized.append(line)
 
-    return BaselineModel(
+    baseline = BaselineModel(
         hostname=hostname, vendor=vendor, platform=platform, version=version,
         serial_number=serial, ip_domain_name=ip_domain_name,
         # 1.1
@@ -364,7 +399,54 @@ def normalize_config(
         admin_timeout_minutes=admin_timeout_minutes,
         unrecognized_lines=still_unrecognized[:20],
         learned_fields=learned_fields,
+        mapping_metadata=mapping_metadata,
     )
+
+    # Cisco syntax populates the existing IOS XE normalized fields. Juniper is
+    # intentionally limited to a small demonstration mapping, not a complete
+    # Juniper parser or a claim of Juniper benchmark compliance.
+    if vendor == "Cisco":
+        baseline.known_fields = list(dict.fromkeys(
+            field for rule in _RULES for field in rule.fields
+        ))
+        if "admin_timeout_minutes" not in baseline.known_fields:
+            baseline.known_fields.append("admin_timeout_minutes")
+    elif vendor == "Juniper":
+        timeout = _find(r"set system login class \S+ idle-timeout\s+(\d+)", text, int)
+        if timeout is not None:
+            baseline.admin_timeout_minutes = timeout
+            baseline.known_fields.append("admin_timeout_minutes")
+            baseline.evidence["admin_timeout_minutes"] = next(
+                line for line in lines_clean if "idle-timeout" in line.lower()
+            )
+    if juniper_ssh_line:
+        baseline.ssh_version = "2"
+        baseline.known_fields.append("ssh_version")
+        baseline.evidence["ssh_version"] = juniper_ssh_line
+        baseline.mapping_metadata["ssh_version"] = {
+            "confidence": 0.97,
+            "human_validated": False,
+            "source": "built_in_juniper_mapping",
+        }
+
+    for field, line in learned_fields.items():
+        setattr(baseline, field, learned_values[field])
+        if field not in baseline.known_fields:
+            baseline.known_fields.append(field)
+        baseline.evidence[field] = line
+
+    if vendor == "Cisco":
+        for rule in _RULES:
+            for field in rule.fields:
+                if field in baseline.evidence:
+                    continue
+                tokens = [token for token in field.split("_") if len(token) > 2]
+                evidence_line = next(
+                    (line for line in lines_clean if any(token in line.lower() for token in tokens)),
+                    "Configuration did not contain a matching command.",
+                )
+                baseline.evidence[field] = evidence_line
+    return baseline
 
 
 # ── RULES TABLE ──────────────────────────────────────────────────────────────
@@ -375,7 +457,7 @@ def normalize_config(
 #                "ssh2"  → field must == "2"
 #                "none_is_na_true" → None → not_applicable; value must be True
 
-_RULES: list[dict] = [
+_RULE_SPECS: list[dict] = [
     # ── 1.1  AAA ─────────────────────────────────────────────────────────────
     dict(cis_id="1.1.1", section="1.1 AAA Rules",
          title="Enable 'aaa new-model'", severity="high",
@@ -629,16 +711,12 @@ _RULES: list[dict] = [
          summary="A consistent source IP in syslog messages prevents log fragmentation.",
          remediation=["logging source-interface Loopback0"],
          field="logging_source_interface", mode="true"),
-    dict(cis_id="2.2.8a", section="2.2 Logging Rules",
-         title="Set 'login on-failure log'", severity="high",
-         summary="Failed login attempts must be logged for intrusion detection.",
-         remediation=["login on-failure log"],
-         field="login_on_failure", mode="true"),
-    dict(cis_id="2.2.8b", section="2.2 Logging Rules",
-         title="Set 'login on-success log'", severity="medium",
-         summary="Successful logins should be logged to provide a complete access audit trail.",
-         remediation=["login on-success log"],
-         field="login_on_success", mode="true"),
+    dict(cis_id="2.2.8", section="2.2 Logging Rules",
+         title="Set 'login success/failure logging'", severity="high",
+         summary="Records successful and failed logins for security monitoring and incident investigation.",
+         remediation=["login on-failure log", "login on-success log"],
+         field="login_on_failure", additional_fields=("login_on_success",),
+         canonical_control="logging.login_success_failure", mode="all_true"),
 
     # ── 2.3  NTP ─────────────────────────────────────────────────────────────
     dict(cis_id="2.3.1.1", section="2.3 NTP Rules",
@@ -683,84 +761,126 @@ _RULES: list[dict] = [
 ]
 
 
+@dataclass(frozen=True)
+class BenchmarkRule:
+    """One CIS requirement, separated from parser-specific field mapping."""
+
+    cis_id: str
+    section: str
+    title: str
+    severity: str
+    summary: str
+    remediation: tuple[str, ...]
+    field: str
+    fields: tuple[str, ...]
+    canonical_control: str
+    expected: str
+    mode: str
+    benchmark: str = BENCHMARK
+    benchmark_version: str = BENCHMARK_VERSION
+    profile: str = "Level 1"
+    assessment_status: str = "Automated"
+
+
+_RULES = [
+    BenchmarkRule(
+        cis_id=spec["cis_id"],
+        section=spec["section"],
+        title=spec["title"],
+        severity=spec["severity"],
+        summary=spec["summary"],
+        remediation=tuple(spec["remediation"]),
+        field=spec["field"],
+        canonical_control=spec.get("canonical_control", canonical_control_for_field(spec["field"])),
+        fields=(spec["field"], *spec.get("additional_fields", ())),
+        expected=("2" if spec["mode"] == "ssh2" else
+                  "disabled" if spec["mode"] == "false" else "enabled"),
+        mode=spec["mode"],
+    )
+    for spec in _RULE_SPECS
+]
+register_supported_fields(
+    [field for rule in _RULES for field in rule.fields] + ["admin_timeout_minutes"]
+)
+
+
 # ── EVALUATION ────────────────────────────────────────────────────────────────
 
 def evaluate(
     baseline: BaselineModel,
-    frameworks: list[str] | None = None,   # kept for API compat, ignored
     learned_patterns: list[LearnedPattern] | None = None,
 ) -> list[Finding]:
-    """Produce one Finding per CIS rule, plus learned-pattern findings."""
+    """Evaluate known canonical facts deterministically against CIS rules."""
     results: list[Finding] = []
 
     for rule in _RULES:
-        field_val = getattr(baseline, rule["field"], None)
-        mode: str = rule["mode"]
+        field_val = getattr(baseline, rule.field, None)
+        field_values = [getattr(baseline, field, None) for field in rule.fields]
+        mode = rule.mode
+        known = all(
+            field in baseline.known_fields and value is not None
+            for field, value in zip(rule.fields, field_values)
+        )
+        status: Literal["pass", "fail", "unknown"] = "unknown"
+        if known:
+            if mode == "true":
+                status = "pass" if field_val is True else "fail"
+            elif mode == "false":
+                status = "pass" if field_val is False else "fail"
+            elif mode == "ssh2":
+                status = "pass" if str(field_val) == "2" else "fail"
+            elif mode == "all_true":
+                status = "pass" if all(value is True for value in field_values) else "fail"
+            elif mode == "none_is_na_true":
+                status = "unknown" if field_val is None else ("pass" if field_val is True else "fail")
 
-        if mode == "true":
-            if field_val is True:
-                status: Literal["pass","fail","review","not_applicable"] = "pass"
-            elif field_val is False:
-                status = "fail"
-            else:
-                status = "review"
-
-        elif mode == "false":
-            if field_val is False:
-                status = "pass"
-            elif field_val is True:
-                status = "fail"
-            else:
-                status = "review"
-
-        elif mode == "ssh2":
-            if field_val == "2":
-                status = "pass"
-            elif field_val is None:
-                status = "review"
-            else:
-                status = "fail"
-
-        elif mode == "none_is_na_true":
-            if field_val is None:
-                status = "not_applicable"
-            elif field_val is True:
-                status = "pass"
-            else:
-                status = "fail"
-
+        metadata = next(
+            (baseline.mapping_metadata.get(field, {}) for field in rule.fields
+             if baseline.mapping_metadata.get(field)),
+            {},
+        )
+        cross_vendor = metadata.get("source") in {
+            "knowledge_base", "built_in_juniper_mapping"
+        } and baseline.vendor != "Cisco"
+        expected = rule.expected
+        if not known:
+            actual = "Unknown"
+        elif mode == "all_true":
+            enabled_count = sum(value is True for value in field_values)
+            actual = (
+                "enabled" if enabled_count == len(field_values)
+                else "partially enabled" if enabled_count
+                else "disabled"
+            )
+        elif isinstance(field_val, bool):
+            actual = "enabled" if field_val else "disabled"
         else:
-            status = "review"
+            actual = str(field_val)
+        evidence = "; ".join(
+            baseline.evidence.get(field, "Not present") for field in rule.fields
+        )
 
         results.append(Finding(
-            id=f"cis-{rule['cis_id']}",
-            cis_id=rule["cis_id"],
-            section=rule["section"],
-            title=rule["title"],
-            severity=rule["severity"],
+            id=f"cis-{rule.cis_id}",
+            framework="CIS",
+            benchmark=rule.benchmark,
+            benchmark_version=rule.benchmark_version,
+            profile=rule.profile,
+            control_id=rule.cis_id,
+            section=rule.section,
+            title=rule.title,
+            severity=rule.severity,
             status=status,
-            summary=rule["summary"],
-            remediation=rule["remediation"],
+            expected=expected,
+            actual=actual,
+            evidence=evidence,
+            canonical_control=rule.canonical_control,
+            remediation=list(rule.remediation),
+            assessment_status=rule.assessment_status,
+            assessment_type="cross_vendor" if cross_vendor else "native",
+            mapping_confidence=float(metadata.get("confidence", 0.97 if cross_vendor else 1.0)),
+            human_validated=bool(metadata.get("human_validated", not cross_vendor)),
+            summary=rule.summary,
             learned=False,
         ))
-
-    # ── Learned-pattern findings ───────────────────────────────────────────
-    seen: set[str] = set()
-    for pattern in (learned_patterns or []):
-        if pattern.normalized_field in seen:
-            continue
-        seen.add(pattern.normalized_field)
-        matched = pattern.normalized_field in baseline.learned_fields
-        results.append(Finding(
-            id=f"learned-{pattern.normalized_field}",
-            cis_id="custom",
-            section="Learned Patterns",
-            title=pattern.label,
-            severity="medium",
-            status="pass" if matched else "review",
-            summary=f"Learned pattern '{pattern.raw_pattern}' → {pattern.normalized_field}",
-            remediation=[],
-            learned=True,
-        ))
-
     return results
