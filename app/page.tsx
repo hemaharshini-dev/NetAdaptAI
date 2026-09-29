@@ -7,6 +7,7 @@ import {
   Check,
   CircleHelp,
   FileDown,
+  House,
   Network,
   Radar,
   ShieldCheck,
@@ -151,7 +152,7 @@ export default function Home() {
   const [isDemo, setIsDemo]           = useState(true);
   const [training, setTraining]       = useState<Training[]>([]);
   const [patterns, setPatterns]       = useState<LearnedPattern[]>([]);
-  const [tab, setTab]                 = useState("current");
+  const [tab, setTab]                 = useState("home");
   const [notice, setNotice]           = useState("");
   const [pasteOpen, setPasteOpen]     = useState(false);
   const [pastedConfig, setPastedConfig] = useState("");
@@ -315,6 +316,7 @@ export default function Home() {
   const passes = findings.filter((f) => f.status === "pass").length;
   const currentTraining = training.filter((item) => device.training_item_ids.includes(item.id));
   const pageTitles: Record<string, string> = {
+    home: "What is NetAdaptAI?",
     current: "Current configuration report",
     overview: "Overall project overview",
     findings: "All assessment findings",
@@ -336,6 +338,9 @@ export default function Home() {
         </div>
         <div className="workspace-label">MENU</div>
         <nav>
+          <button className={`nav-item ${tab === "home" ? "active" : ""}`} onClick={() => setTab("home")}>
+            <House size={17} /> Home
+          </button>
           <button className={`nav-item ${tab === "current" ? "active" : ""}`} onClick={() => setTab("current")}>
             <FileDown size={17} /> Current config report
           </button>
@@ -363,7 +368,7 @@ export default function Home() {
       <section className="content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{tab === "current" ? "LATEST UPLOAD / REPORT" : "PROJECT / WORKSPACE"}</p>
+            <p className="eyebrow">{tab === "home" ? "ABOUT THE PROJECT" : tab === "current" ? "LATEST UPLOAD / REPORT" : "PROJECT / WORKSPACE"}</p>
             <h1>{pageTitles[tab] || pageTitles.current}</h1>
           </div>
           <div className="top-actions">
@@ -412,7 +417,13 @@ export default function Home() {
           </div>
         )}
 
-        {tab === "current" ? (
+        {tab === "home" ? (
+          <HomeLanding
+            onViewReport={() => setTab("current")}
+            onPasteConfig={() => { setPasteOpen(true); setNotice(""); }}
+            onUpload={upload}
+          />
+        ) : tab === "current" ? (
           <div className="current-config-page">
             <section className="panel current-report-panel">
               <div className="current-report-heading">
@@ -658,6 +669,84 @@ function SummaryCard({ label, value, detail }: { label: string; value: string; d
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{detail}</small>
+    </div>
+  );
+}
+
+function HomeLanding({
+  onViewReport,
+  onPasteConfig,
+  onUpload,
+}: {
+  onViewReport: () => void;
+  onPasteConfig: () => void;
+  onUpload: (event: React.ChangeEvent<HTMLInputElement>) => void;
+}) {
+  return (
+    <div className="landing-page">
+      <section className="landing-hero">
+        <div className="landing-copy">
+          <span className="landing-kicker"><Network size={14} /> NETWORK CONFIGURATION ASSESSMENT</span>
+          <h2>Make device security settings easier to understand.</h2>
+          <p>
+            NetAdaptAI reads supported network configuration text, checks it against its current CIS rule set,
+            and turns the results into findings with evidence and remediation guidance.
+          </p>
+          <div className="landing-actions">
+            <label className="upload-button landing-upload">
+              <UploadCloud size={16} /> Upload a configuration
+              <input type="file" accept=".txt,.cfg,.conf,.log" onChange={onUpload} />
+            </label>
+            <button className="outline-button" onClick={onPasteConfig}>Paste configuration</button>
+          </div>
+          <button className="landing-text-link" onClick={onViewReport}>
+            View the current report <ArrowUpRight size={14} />
+          </button>
+        </div>
+        <div className="landing-preview" aria-label="Example assessment preview">
+          <div className="landing-preview-head">
+            <div><span className="label">ASSESSMENT PREVIEW</span><strong>From config to findings</strong></div>
+            <ShieldCheck size={20} />
+          </div>
+          <div className="preview-config-line"><span>INPUT</span><code>ip ssh version 2</code><Check size={14} /></div>
+          <div className="preview-result-row"><span className="preview-dot pass"><Check size={12} /></span><div><strong>PASS</strong><small>Supported setting meets the rule</small></div><span className="preview-state">evidence found</span></div>
+          <div className="preview-result-row"><span className="preview-dot fail"><X size={12} /></span><div><strong>FAIL</strong><small>Supported setting needs attention</small></div><span className="preview-state">remediation shown</span></div>
+          <div className="preview-result-row"><span className="preview-dot unknown"><CircleHelp size={12} /></span><div><strong>UNKNOWN</strong><small>Not enough supported evidence</small></div><span className="preview-state">never assumed passed</span></div>
+          <div className="preview-foot"><Sparkles size={14} /> Human-reviewed mappings can teach the parser new syntax.</div>
+        </div>
+      </section>
+
+      <section className="landing-section">
+        <div className="landing-section-heading">
+          <p className="eyebrow">HOW IT WORKS</p>
+          <h3>A simple review workflow</h3>
+          <p>Start with configuration text and end with a report you can inspect and share.</p>
+        </div>
+        <div className="workflow-grid">
+          <article className="workflow-card"><span>01</span><UploadCloud size={20} /><h4>Upload or paste</h4><p>Provide a Cisco IOS XE configuration as a file or pasted CLI text.</p></article>
+          <article className="workflow-card"><span>02</span><ShieldCheck size={20} /><h4>Assess supported controls</h4><p>Deterministic rules compare normalized facts with the current benchmark rules.</p></article>
+          <article className="workflow-card"><span>03</span><Sparkles size={20} /><h4>Review unknown syntax</h4><p>Optional AI suggestions can be checked and approved by a person before reuse.</p></article>
+          <article className="workflow-card"><span>04</span><FileDown size={20} /><h4>Download a report</h4><p>Export findings, evidence, expected values, and remediation as a PDF.</p></article>
+        </div>
+      </section>
+
+      <section className="landing-scope">
+        <div className="scope-icon"><CircleHelp size={19} /></div>
+        <div>
+          <p className="eyebrow">CURRENT PROTOTYPE SCOPE</p>
+          <h3>One benchmark, with clear limits</h3>
+          <p>
+            The current evaluator contains 56 CIS Cisco IOS XE 17.x Benchmark v2.2.1 Level 1 rule definitions.
+            Unknown controls remain UNKNOWN. Juniper support is limited to a built-in SSHv2 cross-vendor demonstration;
+            it is not a Juniper benchmark assessment.
+          </p>
+        </div>
+        <button className="outline-button" onClick={onViewReport}>Explore the report <ArrowUpRight size={14} /></button>
+      </section>
+
+      <div className="landing-footer-note">
+        <Check size={15} /> AI can suggest a mapping; deterministic rules decide the assessment result.
+      </div>
     </div>
   );
 }
