@@ -246,7 +246,11 @@ def report(device_id: str):
     for finding in current_device.findings[:16]:
         tag = " [LEARNED]" if finding.learned else ""
         pdf.setFont("Helvetica-Bold", 10)
-        pdf.drawString(54, y, f"[{finding.status.upper()}] {finding.framework} - {finding.title}{tag}")
+        pdf.drawString(
+            54,
+            y,
+            f"[{finding.status.upper()}] {finding.cis_id} - {finding.title}{tag}",
+        )
         pdf.setFont("Helvetica", 9)
         pdf.drawString(70, y - 14, finding.summary[:100])
         y -= 38

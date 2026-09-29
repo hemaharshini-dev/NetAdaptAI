@@ -97,7 +97,25 @@ def save_device(device: Device) -> None:
 
 def load_devices() -> list[Device]:
     with Session(_engine) as session:
-        return [Device(**{**record.__dict__, "baseline": record.baseline, "findings": record.findings, "uploaded_at": record.uploaded_at.isoformat()}) for record in session.scalars(select(DeviceRecord)).all()]
+        devices = []
+        for record in session.scalars(select(DeviceRecord)).all():
+            # Older database rows stored findings before cis_id and section
+            # were added to the API model. Fill those display fields while
+            # loading so an existing local database does not prevent startup.
+            findings = []
+            for stored_finding in record.findings or []:
+                finding = dict(stored_finding)
+                finding.setdefault("cis_id", finding.get("id", "legacy"))
+                finding.setdefault("section", finding.get("framework", "Legacy findings"))
+                findings.append(finding)
+
+            devices.append(Device(**{
+                **record.__dict__,
+                "baseline": record.baseline,
+                "findings": findings,
+                "uploaded_at": record.uploaded_at.isoformat(),
+            }))
+        return devices
 
 # ── Training items ────────────────────────────────────────────────────────────
 
